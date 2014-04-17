@@ -276,8 +276,6 @@ let get_edge_ports (t : t) (sw_id : switchId) =
   let open Async_NetKAT in
   let open Net.Topology in
   let topo = !(t.nib) in
-  Log.error ~tags "topo: %s" (Net.Pretty.to_string topo);
-  Log.flushed ();
   let sw = vertex_of_label topo (Switch sw_id) in
   PortSet.fold (fun pt acc ->
       match next_hop topo sw pt with
@@ -316,9 +314,9 @@ let compute_edge_table (t : t) ver table sw_id =
       let pt32 = VInt.get_int32 pt in
       if not (PortSet.mem pt32 internal_ports) && vlan_set
       then (SetField (Vlan, vlan_none)) :: (OutputPort pt) :: (fix_actions false acts)
-      else if (PortSet.mem pt32 internal_ports) && not vlan_set
-      then (SetField (Vlan, ver)) :: (OutputPort pt) :: (fix_actions true acts)
-      else OutputPort pt :: (fix_actions vlan_set acts)
+             (* else if (PortSet.mem pt32 internal_ports) && not vlan_set *)
+      else
+        (SetField (Vlan, ver)) :: (OutputPort pt) :: (fix_actions true acts)
     | OutputAllPorts :: acts -> raise (Assertion_failed "Controller.compute_edge_table: OutputAllPorts not supported by consistent updates")
     | act :: acts -> act :: (fix_actions vlan_set acts)
     | [] -> [] in
@@ -345,6 +343,8 @@ let edge_update_table_for (t : t) ver pol (sw_id : switchId) : unit Deferred.t =
     let priority = ref 65536 in
     let table = NetKAT_LocalCompiler.to_table local in
     let edge_table = compute_edge_table t ver table sw_id in
+    Log.info ~tags
+      "switch %Lu: Installing edge table %s" sw_id (SDN_Types.string_of_flowTable edge_table);
     Deferred.List.iter edge_table ~f:(fun flow ->
         decr priority;
         send t.ctl c_id (0l, to_flow_mod !priority flow)))
@@ -353,6 +353,9 @@ let edge_update_table_for (t : t) ver pol (sw_id : switchId) : unit Deferred.t =
   | Error exn_ ->
     Log.error ~tags
       "switch %Lu: Failed to update table from edge_update_table_for" sw_id;
+    Log.error ~tags
+      "%s" (Exn.to_string exn_);
+    
     Log.flushed ()
 
 let clear_old_table_for (t : t) ver sw_id : unit Deferred.t =
@@ -429,7 +432,7 @@ let handler (t : t) w app =
       begin match e with
         | NetKAT_Types.SwitchUp sw_id ->
           consistently_update_table t (Async_NetKAT.default app)
-          (* update_table_for t sw_id (Async_NetKAT.default app) *)
+        (* update_table_for t sw_id (Async_NetKAT.default app) *)
         | _ -> return ()
       end
 
