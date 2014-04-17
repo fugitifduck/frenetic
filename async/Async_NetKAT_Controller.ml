@@ -290,8 +290,8 @@ let get_internal_ports (t : t) (sw_id : switchId) =
   let open Async_NetKAT in
   let open Net.Topology in
   let topo = !(t.nib) in
-  Log.error ~tags "topo: %s" (Net.Pretty.to_string topo);
-  Log.flushed ();
+  (* Log.error ~tags "topo: %s" (Net.Pretty.to_string topo); *)
+  (* Log.flushed (); *)
   let sw = vertex_of_label topo (Switch sw_id) in
   PortSet.fold (fun pt acc ->
       match next_hop topo sw pt with
@@ -318,6 +318,7 @@ let compute_edge_table (t : t) ver table sw_id =
       else
         (SetField (Vlan, ver)) :: (OutputPort pt) :: (fix_actions true acts)
     | OutputAllPorts :: acts -> raise (Assertion_failed "Controller.compute_edge_table: OutputAllPorts not supported by consistent updates")
+    | Controller n :: acts -> (SetField (Vlan, vlan_none)) :: (Controller n) :: (fix_actions false acts)
     | act :: acts -> act :: (fix_actions vlan_set acts)
     | [] -> [] in
   let match_table = List.fold table ~init:[] ~f:(fun acc r ->
@@ -361,11 +362,12 @@ let edge_update_table_for (t : t) ver pol (sw_id : switchId) : unit Deferred.t =
 let clear_old_table_for (t : t) ver sw_id : unit Deferred.t =
   let open SDN_Types in
   let delete_flows =
-    OpenFlow0x01.Message.FlowModMsg (SDN_OpenFlow0x01.from_flow 0 {pattern = FieldMap.singleton Vlan ver;
+    OpenFlow0x01.Message.FlowModMsg {(SDN_OpenFlow0x01.from_flow 0 {pattern = FieldMap.singleton Vlan ver;
                                                                    action = [];
                                                                    cookie = 0L;
                                                                    idle_timeout = Permanent;
-                                                                   hard_timeout = Permanent}) in
+                                    hard_timeout = Permanent})
+     with command = DeleteFlow} in
   let c_id = Controller.client_id_of_switch t.ctl sw_id in
   Monitor.try_with ~name:"clear_old_table_for" (fun () ->
     send t.ctl c_id (5l, delete_flows))
@@ -431,8 +433,7 @@ let handler (t : t) w app =
     | None ->
       begin match e with
         | NetKAT_Types.SwitchUp sw_id ->
-          consistently_update_table t (Async_NetKAT.default app)
-        (* update_table_for t sw_id (Async_NetKAT.default app) *)
+        update_table_for t sw_id (Async_NetKAT.default app)
         | _ -> return ()
       end
 
