@@ -268,27 +268,45 @@ let internal_update_table_for (t : t) ver pol (sw_id : switchId) : unit Deferred
     | Ok () -> return ()
     | Error exn_ ->
       Log.error ~tags
-        "switch %Lu: Failed to update table" sw_id;
+        "switch %Lu: Failed to update table in internal_update_table_for" sw_id;
       Log.flushed ()
 
+(* Topology detection doesn't really detect hosts. So, I treat any port not connected to a known switch as an edge port *)
 let get_edge_ports (t : t) (sw_id : switchId) =
   let open Async_NetKAT in
   let open Net.Topology in
   let topo = !(t.nib) in
-  let sw = vertex_of_label topo (Switch sw_id) in  
-  let edges = PortSet.fold (fun x acc ->
-      match next_hop topo sw x with
-      | Some e -> (e,x) :: acc
-      | _ -> acc) (vertex_to_ports topo sw) [] in
-  List.fold edges ~init:PortSet.empty ~f:(fun acc (e,p) ->
-      let (node, _) = edge_dst e in
-      match vertex_to_label topo node with
-      | Host _ -> PortSet.add p acc
-      | _ -> acc)
+  Log.error ~tags "topo: %s" (Net.Pretty.to_string topo);
+  Log.flushed ();
+  let sw = vertex_of_label topo (Switch sw_id) in
+  PortSet.fold (fun pt acc ->
+      match next_hop topo sw pt with
+      | Some e -> let (node, _) = edge_dst e in
+        begin match vertex_to_label topo node with
+          | Host _ -> PortSet.add pt acc
+          | _ -> acc
+        end
+      | _ -> PortSet.add pt acc) (vertex_to_ports topo sw) PortSet.empty
+
+let get_internal_ports (t : t) (sw_id : switchId) =
+  let open Async_NetKAT in
+  let open Net.Topology in
+  let topo = !(t.nib) in
+  Log.error ~tags "topo: %s" (Net.Pretty.to_string topo);
+  Log.flushed ();
+  let sw = vertex_of_label topo (Switch sw_id) in
+  PortSet.fold (fun pt acc ->
+      match next_hop topo sw pt with
+      | Some e -> let (node, _) = edge_dst e in
+        begin match vertex_to_label topo node with
+          | Switch _ -> PortSet.add pt acc
+          | _ -> acc
+        end
+      | _ -> acc) (vertex_to_ports topo sw) PortSet.empty
 
 
 let compute_edge_table (t : t) ver table sw_id =
-  let edge_ports = get_edge_ports t sw_id in
+  let internal_ports = get_internal_ports t sw_id in
   let vlan_none = VInt.Int16 65535 in
   (* Fold twice: once to fix match, second to fix fwd *)
   let open SDN_Types in
@@ -296,25 +314,26 @@ let compute_edge_table (t : t) ver table sw_id =
   let rec fix_actions vlan_set = function
     | (OutputPort pt) :: acts ->
       let pt32 = VInt.get_int32 pt in
-      if PortSet.mem pt32 edge_ports && vlan_set
+      if not (PortSet.mem pt32 internal_ports) && vlan_set
       then (SetField (Vlan, vlan_none)) :: (OutputPort pt) :: (fix_actions false acts)
-      else if not (PortSet.mem pt32 edge_ports) && not vlan_set
+      else if (PortSet.mem pt32 internal_ports) && not vlan_set
       then (SetField (Vlan, ver)) :: (OutputPort pt) :: (fix_actions true acts)
       else OutputPort pt :: (fix_actions vlan_set acts)
     | OutputAllPorts :: acts -> raise (Assertion_failed "Controller.compute_edge_table: OutputAllPorts not supported by consistent updates")
     | act :: acts -> act :: (fix_actions vlan_set acts)
     | [] -> [] in
   let match_table = List.fold table ~init:[] ~f:(fun acc r ->
-      if ((FieldMap.mem InPort r.pattern) && (PortSet.mem (VInt.get_int32 (FieldMap.find InPort r.pattern)) edge_ports)) || not (FieldMap.mem InPort r.pattern)
+      if ((FieldMap.mem InPort r.pattern) && (PortSet.mem (VInt.get_int32 (FieldMap.find InPort r.pattern)) internal_ports))
       then
-        {r with pattern = FieldMap.add Vlan vlan_none r.pattern} :: acc
+        acc
       else
-        acc) in
+        {r with pattern = FieldMap.add Vlan vlan_none r.pattern} :: acc)
+  in
   List.fold match_table ~init:[] ~f:(fun acc r ->
-      {r with action = List.map r.action ~f:(fun x -> List.map x ~f:(fix_actions true))} :: acc)
-      
+      {r with action = List.map r.action ~f:(fun x -> List.map x ~f:(fix_actions false))} :: acc)
 
-     
+
+
 let edge_update_table_for (t : t) ver pol (sw_id : switchId) : unit Deferred.t =
   let to_flow_mod prio flow =
     OpenFlow0x01.Message.FlowModMsg (SDN_OpenFlow0x01.from_flow prio flow) in
@@ -333,7 +352,7 @@ let edge_update_table_for (t : t) ver pol (sw_id : switchId) : unit Deferred.t =
   | Ok () -> return ()
   | Error exn_ ->
     Log.error ~tags
-      "switch %Lu: Failed to update table" sw_id;
+      "switch %Lu: Failed to update table from edge_update_table_for" sw_id;
     Log.flushed ()
 
 let clear_old_table_for (t : t) ver sw_id : unit Deferred.t =
@@ -344,18 +363,18 @@ let clear_old_table_for (t : t) ver sw_id : unit Deferred.t =
                                                                    cookie = 0L;
                                                                    idle_timeout = Permanent;
                                                                    hard_timeout = Permanent}) in
-  let c_id = Controller.client_id_of_switch t.ctl sw_id in  
+  let c_id = Controller.client_id_of_switch t.ctl sw_id in
   Monitor.try_with ~name:"clear_old_table_for" (fun () ->
     send t.ctl c_id (5l, delete_flows))
   >>= function
   | Ok () -> return ()
   | Error exn_ ->
     Log.error ~tags
-      "switch %Lu: Failed to update table" sw_id;
+      "switch %Lu: Failed to update table in delete_flows" sw_id;
     Log.flushed ()
-  
+
 let ver = ref 1
-  
+
 let consistently_update_table (t : t) pol : unit Deferred.t =
   let switches = get_switchids !(t.nib) in
   let ver_num = !ver + 1 in
@@ -395,7 +414,7 @@ let update_table_for (t : t) (sw_id : switchId) pol : unit Deferred.t =
     | Ok () -> return ()
     | Error exn_ ->
       Log.error ~tags
-        "switch %Lu: Failed to update table" sw_id;
+        "switch %Lu: Failed to update table in update_table_for" sw_id;
       Log.flushed ()
 
 let handler (t : t) w app =
@@ -403,15 +422,16 @@ let handler (t : t) w app =
   fun e ->
     app' e >>= fun m_pol ->
     match m_pol with
-      | Some (pol) ->
-        Deferred.List.iter (get_switchids !(t.nib)) ~f:(fun sw_id ->
-          update_table_for t sw_id pol)
-      | None ->
-        begin match e with
-          | NetKAT_Types.SwitchUp sw_id ->
-            update_table_for t sw_id (Async_NetKAT.default app)
-          | _ -> return ()
-        end
+    | Some (pol) ->
+      consistently_update_table t pol
+      (* Deferred.List.iter (get_switchids !(t.nib)) (fun sw -> update_table_for t sw pol) *)
+    | None ->
+      begin match e with
+        | NetKAT_Types.SwitchUp sw_id ->
+          consistently_update_table t (Async_NetKAT.default app)
+          (* update_table_for t sw_id (Async_NetKAT.default app) *)
+        | _ -> return ()
+      end
 
 let start app ?(port=6633) () =
   let open Async_OpenFlow.Stage in
