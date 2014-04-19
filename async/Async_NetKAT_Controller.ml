@@ -269,10 +269,10 @@ let internal_update_table_for (t : t) ver pol (sw_id : switchId) : unit Deferred
           (* Add match on ver *)
           let flow = {flow with pattern = { flow.pattern with dlVlan = Some ver }} in
           decr priority;
-          send t.ctl c_id (0l, to_flow_mod !priority flow))
-      >>= fun _ ->
-      t.barriers <- SwitchMap.add t.barriers sw_id (Ivar.create ());
-      send t.ctl c_id (0l, OpenFlow0x01.Message.BarrierRequest))
+          send t.ctl c_id (0l, to_flow_mod !priority flow)))
+      (* >>= fun _ -> *)
+      (* t.barriers <- SwitchMap.add t.barriers sw_id (Ivar.create ()); *)
+      (* send t.ctl c_id (0l, OpenFlow0x01.Message.BarrierRequest)) *)
   >>= function
     | Ok () -> return ()
     | Error exn_ ->
@@ -314,23 +314,23 @@ let get_internal_ports (t : t) (sw_id : switchId) =
 
 let compute_edge_table (t : t) ver table sw_id =
   let internal_ports = get_internal_ports t sw_id in
-  let vlan_none = None in
+  let vlan_none = 65535 in
   (* Fold twice: once to fix match, second to fix fwd *)
   let open SDN_Types in
   let open Async_NetKAT.Net.Topology in
-  let rec fix_actions vlan_set = function
+  let rec fix_actions = function
     | (OutputPort pt) :: acts ->
-      if not (PortSet.mem pt internal_ports) && vlan_set
+      if not (PortSet.mem pt internal_ports)
       then
-        (Modify (SetVlan vlan_none)) :: (OutputPort pt) :: (fix_actions false acts)
+        (Modify (SetVlan None)) :: (OutputPort pt) :: (fix_actions acts)
       else
-        (Modify (SetVlan (Some ver))) :: (OutputPort pt) :: (fix_actions true acts)
+        (Modify (SetVlan (Some ver))) :: (OutputPort pt) :: (fix_actions acts)
     | OutputAllPorts :: acts ->
       raise (Assertion_failed "Controller.compute_edge_table: OutputAllPorts not supported by consistent updates")
     | Controller n :: acts ->
-      (Modify (SetVlan vlan_none)) :: (Controller n) :: (fix_actions false acts)
+      (Modify (SetVlan None)) :: (Controller n) :: (fix_actions acts)
     | act :: acts ->
-      act :: (fix_actions vlan_set acts)
+      act :: (fix_actions acts)
     | [] -> []
   in
   let match_table = List.fold table ~init:[] ~f:(fun acc r ->
@@ -339,13 +339,13 @@ let compute_edge_table (t : t) ver table sw_id =
         | Some pt ->
           if PortSet.mem pt internal_ports
           then acc
-          else {r with pattern = {r.pattern with dlVlan = vlan_none}} :: acc
+          else {r with pattern = {r.pattern with dlVlan = Some vlan_none}} :: acc
         | None ->
-          {r with pattern = {r.pattern with dlVlan = vlan_none}} :: acc
+          {r with pattern = {r.pattern with dlVlan = Some vlan_none}} :: acc
       end)
   in
   List.fold match_table ~init:[] ~f:(fun acc r ->
-      {r with action = List.map r.action ~f:(fun x -> List.map x ~f:(fix_actions false))} :: acc)
+      {r with action = List.map r.action ~f:(fun x -> List.map x ~f:(fix_actions))} :: acc)
 
 
 
@@ -364,10 +364,10 @@ let edge_update_table_for (t : t) ver pol (sw_id : switchId) : unit Deferred.t =
       "switch %Lu: Installing edge table %s" sw_id (SDN_Types.string_of_flowTable edge_table);
     Deferred.List.iter edge_table ~f:(fun flow ->
         decr priority;
-        send t.ctl c_id (0l, to_flow_mod !priority flow))
-    >>= fun _ ->
-    t.barriers <- SwitchMap.add t.barriers sw_id (Ivar.create ());
-    send t.ctl c_id (0l, OpenFlow0x01.Message.BarrierRequest))
+        send t.ctl c_id (0l, to_flow_mod !priority flow)))
+    (* >>= fun _ -> *)
+    (* t.barriers <- SwitchMap.add t.barriers sw_id (Ivar.create ()); *)
+    (* send t.ctl c_id (0l, OpenFlow0x01.Message.BarrierRequest)) *)
   >>= function
   | Ok () -> return ()
   | Error exn_ ->
@@ -404,13 +404,13 @@ let consistently_update_table (t : t) pol : unit Deferred.t =
   let ver_num = !ver + 1 in
   (* Install internal update *)
   Deferred.List.iter switches (internal_update_table_for t ver_num pol)
-  >>=
-  fun () -> Deferred.Map.iter t.barriers ~f:(fun ~key ~data -> Ivar.read data)
+  (* >>= *)
+  (* fun () -> Deferred.Map.iter t.barriers ~f:(fun ~key ~data -> Ivar.read data) *)
   >>=
   (* Install edge update *)
   fun () -> Deferred.List.iter switches (edge_update_table_for t ver_num pol)
-  >>=
-  fun () -> Deferred.Map.iter t.barriers ~f:(fun ~key ~data -> Ivar.read data)
+  (* >>= *)
+  (* fun () -> Deferred.Map.iter t.barriers ~f:(fun ~key ~data -> Ivar.read data) *)
   >>=
   (* Delete old rules *)
   fun () -> Deferred.List.iter switches (clear_old_table_for t (ver_num - 1))
