@@ -69,20 +69,20 @@ let headers_to_actions
      | NetKAT_Types.Pipe p ->
        raise (Assertion_failed (Printf.sprintf
          "Controller.headers_to_action: impossible pipe location \"%s\"" p))
-     | NetKAT_Types.Physical p -> [OutputPort(VInt.Int32 p)] in
+     | NetKAT_Types.Physical p -> [OutputPort(p)] in
   NetKAT_Types.HeadersValues.Fields.fold
     ~init
     ~location:(fun acc f -> acc)
-    ~ethSrc:(g (fun v -> SetField(EthSrc, VInt.Int48 v)))
-    ~ethDst:(g (fun v -> SetField(EthDst, VInt.Int48 v)))
-    ~vlan:(g (fun v -> SetField(Vlan, VInt.Int16 v)))
-    ~vlanPcp:(g (fun v -> SetField(VlanPcp, VInt.Int8 v)))
-    ~ethType:(g (fun v -> SetField(EthType, VInt.Int16 v)))
-    ~ipProto:(g (fun v -> SetField(IPProto, VInt.Int8 v)))
-    ~ipSrc:(g (fun v -> SetField(IP4Src, VInt.Int32 v)))
-    ~ipDst:(g (fun v -> SetField(IP4Dst, VInt.Int32 v)))
-    ~tcpSrcPort:(g (fun v -> SetField(TCPSrcPort, VInt.Int16 v)))
-    ~tcpDstPort:(g (fun v -> SetField(TCPDstPort, VInt.Int16 v)))
+    ~ethSrc:(g (fun v -> Modify(SetEthSrc v)))
+    ~ethDst:(g (fun v -> Modify(SetEthDst v)))
+    ~vlan:(g (fun v -> Modify(SetVlan (Some(v)))))
+    ~vlanPcp:(g (fun v -> Modify(SetVlanPcp v)))
+    ~ethType:(g (fun v -> Modify(SetEthTyp v)))
+    ~ipProto:(g (fun v -> Modify(SetIPProto v)))
+    ~ipSrc:(g (fun v -> Modify(SetIP4Src v)))
+    ~ipDst:(g (fun v -> Modify(SetIP4Dst v)))
+    ~tcpSrcPort:(g (fun v -> Modify(SetTCPSrcPort v)))
+    ~tcpDstPort:(g (fun v -> Modify(SetTCPDstPort v)))
 
 exception Unsupported_mod of string
 
@@ -102,7 +102,7 @@ let packet_sync_headers (pkt:NetKAT_Types.packet) : NetKAT_Types.packet * bool =
       q acc v
     end in
   let fail field = (fun _ -> raise (Unsupported_mod field)) in
-  let packet = Packet.parse (payload_bytes pkt.payload) in
+  let packet = Packet.parse (SDN_Types.payload_bytes pkt.payload) in
   let packet' = HeadersValues.Fields.fold
     ~init:packet
     ~location:(fun acc _ -> acc)
@@ -131,17 +131,6 @@ let packet_sync_headers (pkt:NetKAT_Types.packet) : NetKAT_Types.packet * bool =
     | SDN_Types.Buffered(n, _) -> SDN_Types.Buffered(n, Packet.marshal packet')
   }, !change)
 
-let packet_out_to_message (_, bytes, buffer_id, port_id, actions) =
-  let open OpenFlow0x01_Core in
-  let output_payload = match buffer_id with
-    | Some(id) -> Buffered(id, bytes)
-    | None -> NotBuffered bytes in
-  let port_id = match port_id with
-    | Some(vi) -> Some(VInt.get_int vi)
-    | None -> None in
-  let apply_actions = SDN_OpenFlow0x01.from_group port_id [[actions]] in
-  OpenFlow0x01.Message.PacketOutMsg{ output_payload; port_id; apply_actions }
-
 let send t c_id msg =
   Controller.send t c_id msg
   >>| function
@@ -165,7 +154,7 @@ let to_event w_out (t : t) evt =
       return ((SwitchUp sw_id) :: (List.fold ports ~init:[] ~f:(fun acc pd ->
         let open OpenFlow0x01.PortDescription in
         if port_desc_useable pd && pd.port_no < 0xff00 then
-          let pt_id = VInt.Int32 (Int32.of_int_exn pd.port_no) in
+          let pt_id = Int32.of_int_exn pd.port_no in
           PortUp(sw_id, pt_id)::acc
         else
           acc)))
@@ -173,7 +162,7 @@ let to_event w_out (t : t) evt =
       let open Net.Topology in
       let v  = vertex_of_label !(t.nib) (Async_NetKAT.Switch switch_id) in
       let ps = vertex_to_ports !(t.nib) v in
-      return (PortSet.fold (fun p acc -> (PortDown(switch_id, VInt.Int32 p))::acc)
+      return (PortSet.fold (fun p acc -> (PortDown(switch_id, p))::acc)
         ps [SwitchDown switch_id])
     | `Message (c_id, (xid, msg)) ->
       let open OpenFlow0x01.Message in
@@ -181,7 +170,7 @@ let to_event w_out (t : t) evt =
       begin match msg with
         | PacketInMsg pi ->
           let open OpenFlow0x01_Core in
-          let port_id = VInt.Int16 pi.port in
+          let port_id = Int32.of_int_exn pi.port in
           let buf_id, bytes = match pi.input_payload with
             | Buffered(n, bs) -> Some(n), bs
             | NotBuffered(bs) -> None, bs in
@@ -209,16 +198,22 @@ let to_event w_out (t : t) evt =
                 let outs = Deferred.List.iter phys ~f:(fun packet1 ->
                   let acts = headers_to_actions
                     packet1.headers packet.headers in
-                  let out = (switch_id, bytes, buf_id, Some(port_id), acts) in
+                  let payload = match buf_id with
+                    | None -> SDN_Types.NotBuffered(bytes)
+                    | Some(buf_id) -> SDN_Types.Buffered(buf_id, bytes) in
+                  let out = (switch_id, (payload, Some(port_id), acts)) in
                   Pipe.write w_out out) in
                 outs >>= fun _ ->
                 return (List.map pis ~f:(fun (p, pkt) ->
                   let pkt', changed = packet_sync_headers pkt in
-                  if changed then
-                    let bytes = payload_bytes pkt'.payload in
-                    PacketIn(p, switch_id, port_id, bytes, pi.total_len, None)
-                  else
-                    PacketIn(p, switch_id, port_id, bytes, pi.total_len, buf_id)))
+                  let payload = match buf_id, changed with
+                      | None, _
+                      | _   , true ->
+                        SDN_Types.NotBuffered(payload_bytes pkt'.payload)
+                      | Some(buf_id), false ->
+                        SDN_Types.Buffered(buf_id, bytes)
+                  in
+                  PacketIn(p, switch_id, port_id, payload, pi.total_len)))
               end
           end
         | PortStatusMsg ps ->
@@ -227,11 +222,11 @@ let to_event w_out (t : t) evt =
             | ChangeReason.Add, true
             | ChangeReason.Modify, true ->
               let pt_id = Int32.of_int_exn (ps.desc.OpenFlow0x01.PortDescription.port_no) in
-              return [PortUp(switch_id, VInt.Int32 pt_id)]
+              return [PortUp(switch_id, pt_id)]
             | ChangeReason.Delete, _
             | ChangeReason.Modify, false ->
               let pt_id = Int32.of_int_exn (ps.desc.OpenFlow0x01.PortDescription.port_no) in
-              return [PortDown(switch_id, VInt.Int32 pt_id)]
+              return [PortDown(switch_id, pt_id)]
             | _ ->
               return []
           end
@@ -272,7 +267,7 @@ let internal_update_table_for (t : t) ver pol (sw_id : switchId) : unit Deferred
           "Controller.internal_update_table_for: empty table for switch %Lu" sw_id));
       Deferred.List.iter table ~f:(fun flow ->
           (* Add match on ver *)
-          let flow = {flow with pattern = SDN_Types.FieldMap.add Vlan ver flow.pattern} in
+          let flow = {flow with pattern = { flow.pattern with dlVlan = Some ver }} in
           decr priority;
           send t.ctl c_id (0l, to_flow_mod !priority flow))
       >>= fun _ ->
@@ -319,32 +314,35 @@ let get_internal_ports (t : t) (sw_id : switchId) =
 
 let compute_edge_table (t : t) ver table sw_id =
   let internal_ports = get_internal_ports t sw_id in
-  let vlan_none = VInt.Int16 65535 in
+  let vlan_none = None in
   (* Fold twice: once to fix match, second to fix fwd *)
   let open SDN_Types in
   let open Async_NetKAT.Net.Topology in
   let rec fix_actions vlan_set = function
     | (OutputPort pt) :: acts ->
-      let pt32 = VInt.get_int32 pt in
-      if not (PortSet.mem pt32 internal_ports) && vlan_set
+      if not (PortSet.mem pt internal_ports) && vlan_set
       then
-        (SetField (Vlan, vlan_none)) :: (OutputPort pt) :: (fix_actions false acts)
+        (Modify (SetVlan vlan_none)) :: (OutputPort pt) :: (fix_actions false acts)
       else
-        (SetField (Vlan, ver)) :: (OutputPort pt) :: (fix_actions true acts)
+        (Modify (SetVlan (Some ver))) :: (OutputPort pt) :: (fix_actions true acts)
     | OutputAllPorts :: acts ->
       raise (Assertion_failed "Controller.compute_edge_table: OutputAllPorts not supported by consistent updates")
     | Controller n :: acts ->
-      (SetField (Vlan, vlan_none)) :: (Controller n) :: (fix_actions false acts)
+      (Modify (SetVlan vlan_none)) :: (Controller n) :: (fix_actions false acts)
     | act :: acts ->
       act :: (fix_actions vlan_set acts)
     | [] -> []
   in
   let match_table = List.fold table ~init:[] ~f:(fun acc r ->
-      if ((FieldMap.mem InPort r.pattern) && (PortSet.mem (VInt.get_int32 (FieldMap.find InPort r.pattern)) internal_ports))
-      then
-        acc
-      else
-        {r with pattern = FieldMap.add Vlan vlan_none r.pattern} :: acc)
+      begin
+        match r.pattern.inPort with
+        | Some pt ->
+          if PortSet.mem pt internal_ports
+          then acc
+          else {r with pattern = {r.pattern with dlVlan = vlan_none}} :: acc
+        | None ->
+          {r with pattern = {r.pattern with dlVlan = vlan_none}} :: acc
+      end)
   in
   List.fold match_table ~init:[] ~f:(fun acc r ->
       {r with action = List.map r.action ~f:(fun x -> List.map x ~f:(fix_actions false))} :: acc)
@@ -383,7 +381,7 @@ let edge_update_table_for (t : t) ver pol (sw_id : switchId) : unit Deferred.t =
 let clear_old_table_for (t : t) ver sw_id : unit Deferred.t =
   let open SDN_Types in
   let delete_flows =
-    OpenFlow0x01.Message.FlowModMsg {(SDN_OpenFlow0x01.from_flow 0 {pattern = FieldMap.singleton Vlan ver;
+    OpenFlow0x01.Message.FlowModMsg {(SDN_OpenFlow0x01.from_flow 0 {pattern = {all_pattern with dlVlan = Some ver};
                                                                    action = [];
                                                                    cookie = 0L;
                                                                    idle_timeout = Permanent;
@@ -405,17 +403,17 @@ let consistently_update_table (t : t) pol : unit Deferred.t =
   let switches = get_switchids !(t.nib) in
   let ver_num = !ver + 1 in
   (* Install internal update *)
-  Deferred.List.iter switches (internal_update_table_for t (VInt.Int16 ver_num) pol)
+  Deferred.List.iter switches (internal_update_table_for t ver_num pol)
   >>=
   fun () -> Deferred.Map.iter t.barriers ~f:(fun ~key ~data -> Ivar.read data)
   >>=
   (* Install edge update *)
-  fun () -> Deferred.List.iter switches (edge_update_table_for t (VInt.Int16 ver_num) pol)
+  fun () -> Deferred.List.iter switches (edge_update_table_for t ver_num pol)
   >>=
   fun () -> Deferred.Map.iter t.barriers ~f:(fun ~key ~data -> Ivar.read data)
   >>=
   (* Delete old rules *)
-  fun () -> Deferred.List.iter switches (clear_old_table_for t (VInt.Int16 (ver_num - 1)))
+  fun () -> Deferred.List.iter switches (clear_old_table_for t (ver_num - 1))
   >>=
   (* Incr ver number *)
   fun () -> return (incr ver)
@@ -430,7 +428,6 @@ let update_table_for (t : t) (sw_id : switchId) pol : unit Deferred.t =
   t.locals <- SwitchMap.add t.locals sw_id
     (Optimize.specialize_policy sw_id pol);
   let local = NetKAT_LocalCompiler.compile sw_id pol in
-  Log.info ~tags "switch %Lu local: %s" sw_id (NetKAT_LocalCompiler.to_string local);
   Monitor.try_with ~name:"update_table_for" (fun () ->
     send t.ctl c_id (5l, delete_flows) >>= fun _ ->
     let priority = ref 65536 in
@@ -481,10 +478,11 @@ let start app ?(port=6633) () =
      * *)
     let r_out, w_out = Pipe.create () in
     Deferred.don't_wait_for (Pipe.iter r_out ~f:(fun out ->
-      let (sw_id, _, _, _, _) = out in
+      let (sw_id, pkt_out) = out in
       Monitor.try_with ~name:"packet_out" (fun () ->
         let c_id = Controller.client_id_of_switch ctl sw_id in
-        send ctl c_id (0l, packet_out_to_message out))
+        send ctl c_id (0l, OpenFlow0x01.Message.PacketOutMsg
+          (SDN_OpenFlow0x01.from_packetOut pkt_out)))
       >>= function
         | Ok () -> return ()
         | Error exn_ ->
