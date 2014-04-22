@@ -9,12 +9,13 @@ module SDN = SDN_Types
 type switchId = SDN_Types.switchId
 
 module SwitchMap = Map.Make(Int64)
+module XidMap = Map.Make(Int32)
 
 module Log = Async_OpenFlow.Log
 
 let max_pending_connections = 64
 
-let _ = Log.set_level `Info
+let _ = Log.set_level `Debug
 
 let _ = Log.set_output
           [Log.make_filtered_output
@@ -35,7 +36,7 @@ type t = {
   ctl : Controller.t;
   nib : Net.Topology.t ref;
   mutable locals : NetKAT_Types.policy SwitchMap.t;
-  mutable barriers : (unit Ivar.t) SwitchMap.t
+  mutable barriers : (unit Ivar.t) XidMap.t
 }
 
 let bytes_to_headers port_id (bytes : Cstruct.t) =
@@ -230,10 +231,10 @@ let to_event w_out (t : t) evt =
             | _ ->
               return []
           end
-          (* MJR: Hardcoding the consistent updates barrier protocol rather than exposing barriers in NetKAT_Types.event *)
         | BarrierReply ->
           Log.debug ~tags "Received barrier_reply %Lu" switch_id;
-          begin match SwitchMap.find t.barriers switch_id with
+          Log.flushed ();          
+          begin match XidMap.find t.barriers xid with
             | None -> Log.error ~tags "to_event: received unexpected BarrierReply from %Lu" switch_id;
               Log.flushed ();
               ()
@@ -250,6 +251,20 @@ let get_switchids nib =
     | Async_NetKAT.Switch id -> id::acc
     | _ -> acc)
   nib []
+
+let _xid = ref 0l
+
+let next_xid () =
+  _xid := Int32.succ (!_xid);
+  !_xid
+  
+let send_barrier_to_sw (t : t) (sw_id : switchId) : unit Deferred.t =
+  let ivar = Ivar.create () in
+  let xid = next_xid () in
+  let c_id = Controller.client_id_of_switch t.ctl sw_id in
+  t.barriers <- XidMap.add t.barriers xid ivar;
+  send t.ctl c_id (xid, OpenFlow0x01.Message.BarrierRequest);
+  Ivar.read ivar
 
 let internal_update_table_for (t : t) ver pol (sw_id : switchId) : unit Deferred.t =
   let to_flow_mod prio flow =
@@ -270,15 +285,15 @@ let internal_update_table_for (t : t) ver pol (sw_id : switchId) : unit Deferred
           let flow = {flow with pattern = { flow.pattern with dlVlan = Some ver }} in
           decr priority;
           send t.ctl c_id (0l, to_flow_mod !priority flow)))
-      (* >>= fun _ -> *)
-      (* t.barriers <- SwitchMap.add t.barriers sw_id (Ivar.create ()); *)
-      (* send t.ctl c_id (0l, OpenFlow0x01.Message.BarrierRequest)) *)
   >>= function
-    | Ok () -> return ()
-    | Error exn_ ->
-      Log.error ~tags
-        "switch %Lu: Failed to update table in internal_update_table_for" sw_id;
-      Log.flushed ()
+  | Ok () ->
+    Log.debug ~tags
+      "switch %Lu: installed internal table for ver %d" sw_id ver;
+    Log.flushed ()
+  | Error exn_ ->
+    Log.error ~tags
+      "switch %Lu: Failed to update table in internal_update_table_for" sw_id;
+    Log.flushed ()
 
 (* Topology detection doesn't really detect hosts. So, I treat any port not connected to a known switch as an edge port *)
 let get_edge_ports (t : t) (sw_id : switchId) =
@@ -365,11 +380,11 @@ let edge_update_table_for (t : t) ver pol (sw_id : switchId) : unit Deferred.t =
     Deferred.List.iter edge_table ~f:(fun flow ->
         decr priority;
         send t.ctl c_id (0l, to_flow_mod !priority flow)))
-    (* >>= fun _ -> *)
-    (* t.barriers <- SwitchMap.add t.barriers sw_id (Ivar.create ()); *)
-    (* send t.ctl c_id (0l, OpenFlow0x01.Message.BarrierRequest)) *)
   >>= function
-  | Ok () -> return ()
+  | Ok () ->
+    Log.debug ~tags
+      "switch %Lu: installed edge table for ver %d" sw_id ver;
+    Log.flushed ()
   | Error exn_ ->
     Log.error ~tags
       "switch %Lu: Failed to update table from edge_update_table_for" sw_id;
@@ -403,14 +418,26 @@ let consistently_update_table (t : t) pol : unit Deferred.t =
   let switches = get_switchids !(t.nib) in
   let ver_num = !ver + 1 in
   (* Install internal update *)
-  Deferred.List.iter switches (internal_update_table_for t ver_num pol)
-  (* >>= *)
-  (* fun () -> Deferred.Map.iter t.barriers ~f:(fun ~key ~data -> Ivar.read data) *)
+  Log.debug ~tags "Installing internal tables for ver %d" ver_num;
+  Log.flushed ()
+  >>=
+  fun () -> Deferred.List.iter switches (internal_update_table_for t ver_num pol)
+  >>=
+  fun () -> Log.debug ~tags "Sending barriers for ver %d" ver_num;
+  Log.flushed ()
+  >>=
+  fun () -> Deferred.List.all_unit (List.map switches ~f:(send_barrier_to_sw t))
+  >>=
+  fun () -> Log.debug ~tags "Installing edge tables for ver %d" ver_num;
+  Log.flushed ()
   >>=
   (* Install edge update *)
   fun () -> Deferred.List.iter switches (edge_update_table_for t ver_num pol)
-  (* >>= *)
-  (* fun () -> Deferred.Map.iter t.barriers ~f:(fun ~key ~data -> Ivar.read data) *)
+  >>=
+  fun () -> Log.debug ~tags "Sending barriers for ver %d" ver_num;
+  Log.flushed ()
+  >>=
+  fun () -> Deferred.List.all_unit (List.map switches (send_barrier_to_sw t))  
   >>=
   (* Delete old rules *)
   fun () -> Deferred.List.iter switches (clear_old_table_for t (ver_num - 1))
@@ -470,7 +497,7 @@ let start app ?(port=6633) () =
       ctl = ctl;
       nib = ref (Net.Topology.empty ());
       locals = SwitchMap.empty;
-      barriers = SwitchMap.empty;
+      barriers = XidMap.empty;
     } in
 
     (* The pipe for packet_outs. The Pipe.iter below will run in its own logical
