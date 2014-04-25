@@ -36,7 +36,8 @@ type t = {
   ctl : Controller.t;
   nib : Net.Topology.t ref;
   mutable locals : NetKAT_Types.policy SwitchMap.t;
-  mutable barriers : (unit Ivar.t) XidMap.t
+  mutable barriers : (unit Ivar.t) XidMap.t;
+  mutable edge : (SDN_Types.flow*int) list SwitchMap.t;
 }
 
 let bytes_to_headers port_id (bytes : Cstruct.t) =
@@ -374,6 +375,39 @@ let compute_edge_table (t : t) ver table sw_id =
   List.fold match_table ~init:[] ~f:(fun acc r ->
       {r with action = List.map r.action ~f:(fun x -> List.map x ~f:(fix_actions))} :: acc)
 
+let (>>-) a b = a >>= fun _ -> b
+
+(* Assumptions:
+   - switch respects priorities when deleting flows
+   - existing FT is installed in the top half of the priorities
+*)
+let swap_update_for (t : t) sw_id new_table : unit Deferred.t =
+  let mid_priority = 65535 / 2 in
+  let old_table = match SwitchMap.find t.edge sw_id with
+    | Some ft -> ft
+    | None -> [] in
+  let (new_table, _, _) = List.fold new_table ~init:([], mid_priority, 65535)
+      ~f:(fun (acc,pri1,pri2) x -> ((x,pri1,pri2) :: acc, pri1 - 1, pri2 - 1)) in
+  let new_table = List.rev new_table in
+  let c_id = Controller.client_id_of_switch t.ctl sw_id in
+  let to_flow_mod prio flow =
+    OpenFlow0x01.Message.FlowModMsg (SDN_OpenFlow0x01.from_flow prio flow) in
+  let to_flow_del prio flow =
+    OpenFlow0x01.Message.FlowModMsg ({SDN_OpenFlow0x01.from_flow prio flow with command = DeleteFlow}) in
+  (* Install the new table at lowest priority *)
+  Deferred.List.iter new_table ~f:(fun (flow, prio, _) ->
+      send t.ctl c_id (0l, to_flow_mod prio flow))
+  (* Delete the old table from high priority *)
+  >>- Deferred.List.iter (List.rev old_table) ~f:(fun (flow, prio) ->
+      send t.ctl c_id (0l, to_flow_del prio flow))
+  (* Install the new table at highest priority *)
+  >>- Deferred.List.iter new_table ~f:(fun (flow, _, prio) ->
+      send t.ctl c_id (0l, to_flow_mod prio flow))
+  (* Delete the new table from low priority *)
+  >>- Deferred.List.iter new_table ~f:(fun (flow, prio, _) ->
+      send t.ctl c_id (0l, to_flow_del prio flow))
+  >>- (t.edge <- SwitchMap.add t.edge sw_id (List.map new_table ~f:(fun (flow, _, prio) -> (flow, prio)));
+       return ())
 
 
 let edge_update_table_for (t : t) ver pol (sw_id : switchId) : unit Deferred.t =
@@ -389,10 +423,8 @@ let edge_update_table_for (t : t) ver pol (sw_id : switchId) : unit Deferred.t =
     let edge_table = compute_edge_table t ver table sw_id in
     Log.debug ~tags
       "switch %Lu: Installing edge table %s" sw_id (SDN_Types.string_of_flowTable edge_table);
-    Deferred.List.iter edge_table ~f:(fun flow ->
-        decr priority;
-        send t.ctl c_id (0l, to_flow_mod !priority flow))
-    >>= fun () ->  send_barrier_to_sw_with_timeout t sw_id)
+    swap_update_for t sw_id edge_table
+    >>- send_barrier_to_sw_with_timeout t sw_id)
   >>= function
   | Ok () ->
     Log.debug ~tags
@@ -413,40 +445,40 @@ let clear_old_table_for (t : t) ver sw_id : unit Deferred.t =
                                                                    action = [];
                                                                    cookie = 0L;
                                                                    idle_timeout = Permanent;
-                                    hard_timeout = Permanent})
-     with command = DeleteFlow} in
+                                                                   hard_timeout = Permanent})
+    with command = DeleteFlow} in
   let c_id = Controller.client_id_of_switch t.ctl sw_id in
   Monitor.try_with ~name:"clear_old_table_for" (fun () ->
     send t.ctl c_id (5l, delete_flows))
-  >>= function
-  | Ok () -> return ()
-  | Error exn_ ->
-    Log.error ~tags
-      "switch %Lu: Failed to update table in delete_flows" sw_id;
-    Log.flushed ()
+      >>= function
+        | Ok () -> return ()
+        | Error exn_ ->
+          Log.error ~tags
+            "switch %Lu: Failed to update table in delete_flows" sw_id;
+          Log.flushed ()
 
-let ver = ref 1
-
+let ver = ref 1 
+  
 let consistently_update_table (t : t) pol : unit Deferred.t =
   let switches = get_switchids !(t.nib) in
   let ver_num = !ver + 1 in
   (* Install internal update *)
   Log.debug ~tags "Installing internal tables for ver %d" ver_num;
   Log.flushed ()
-  >>=
-  fun () -> Deferred.List.iter switches (internal_update_table_for t ver_num pol)
-  >>=
-  fun () -> Log.debug ~tags "Installing edge tables for ver %d" ver_num;
-  Log.flushed ()
-  >>=
+  >>-
+  Deferred.List.iter switches (internal_update_table_for t ver_num pol)
+  >>-
+  (Log.debug ~tags "Installing edge tables for ver %d" ver_num;
+   Log.flushed ())
+  >>-
   (* Install edge update *)
-  fun () -> Deferred.List.iter switches (edge_update_table_for t ver_num pol)
-  >>=
+  Deferred.List.iter switches (edge_update_table_for t ver_num pol)
+  >>-
   (* Delete old rules *)
-  fun () -> Deferred.List.iter switches (clear_old_table_for t (ver_num - 1))
-  >>=
+  Deferred.List.iter switches (clear_old_table_for t (ver_num - 1))
+  >>-
   (* Incr ver number *)
-  fun () -> return (incr ver)
+  return (incr ver)
 
 let update_table_for (t : t) (sw_id : switchId) pol : unit Deferred.t =
   Log.info ~tags "switch %Lu: %s" sw_id (NetKAT_Pretty.string_of_policy pol);
@@ -501,6 +533,7 @@ let start app ?(port=6633) () =
       nib = ref (Net.Topology.empty ());
       locals = SwitchMap.empty;
       barriers = XidMap.empty;
+      edge = SwitchMap.empty;
     } in
 
     (* The pipe for packet_outs. The Pipe.iter below will run in its own logical
