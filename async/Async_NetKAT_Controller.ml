@@ -265,7 +265,7 @@ let send_barrier_to_sw (t : t) (sw_id : switchId) : unit Deferred.t =
   let xid = next_xid () in
   let c_id = Controller.client_id_of_switch t.ctl sw_id in
   t.barriers <- XidMap.add t.barriers xid ivar;
-  send t.ctl c_id (xid, OpenFlow0x01.Message.BarrierRequest);
+  send t.ctl c_id (xid, OpenFlow0x01.Message.BarrierRequest) >>= fun () ->
   Ivar.read ivar
 
 let send_barrier_to_sw_with_timeout (t : t) (sw_id : switchId) : unit Deferred.t =
