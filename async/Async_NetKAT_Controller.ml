@@ -377,36 +377,44 @@ let compute_edge_table (t : t) ver table sw_id =
 
 let (>>-) a b = a >>= fun _ -> b
 
+(* Comparison should be made based on patterns only, not actions *)
+(* Assumes both FT are sorted in descending order by priority *)
+let rec flowtable_diff (ft1 : (SDN_Types.flow*int) list) (ft2 : (SDN_Types.flow*int) list) =
+  match ft1,ft2 with
+  | (flow1,pri1)::ft1, (flow2,pri2)::ft2 ->
+    if pri1 > pri2
+    then (flow1, pri1) :: flowtable_diff ft1 ((flow2,pri2)::ft2)
+    else if pri1 = pri2 && flow1.pattern = flow2.pattern
+    then flowtable_diff ft1 ((flow2,pri2)::ft2)
+    else
+      flowtable_diff ((flow1,pri1) :: ft1) ft2
+  | _, [] -> ft1
+  | [], _ -> []
+
 (* Assumptions:
    - switch respects priorities when deleting flows
-   - existing FT is installed in the top half of the priorities
 *)
 let swap_update_for (t : t) sw_id new_table : unit Deferred.t =
-  let mid_priority = 65535 / 2 in
+  let max_priority = 65535 in
   let old_table = match SwitchMap.find t.edge sw_id with
     | Some ft -> ft
     | None -> [] in
-  let (new_table, _, _) = List.fold new_table ~init:([], mid_priority, 65535)
-      ~f:(fun (acc,pri1,pri2) x -> ((x,pri1,pri2) :: acc, pri1 - 1, pri2 - 1)) in
+  let (new_table, _) = List.fold new_table ~init:([], max_priority)
+      ~f:(fun (acc,pri) x -> ((x,pri) :: acc, pri - 1)) in
   let new_table = List.rev new_table in
+  let del_table = List.rev (flowtable_diff old_table new_table) in
   let c_id = Controller.client_id_of_switch t.ctl sw_id in
   let to_flow_mod prio flow =
     OpenFlow0x01.Message.FlowModMsg (SDN_OpenFlow0x01.from_flow prio flow) in
   let to_flow_del prio flow =
-    OpenFlow0x01.Message.FlowModMsg ({SDN_OpenFlow0x01.from_flow prio flow with command = DeleteFlow}) in
-  (* Install the new table at lowest priority *)
-  Deferred.List.iter new_table ~f:(fun (flow, prio, _) ->
+    OpenFlow0x01.Message.FlowModMsg ({SDN_OpenFlow0x01.from_flow prio flow with command = DeleteStrictFlow}) in
+  (* Install the new table *)
+  Deferred.List.iter new_table ~f:(fun (flow, prio) ->
       send t.ctl c_id (0l, to_flow_mod prio flow))
-  (* Delete the old table from high priority *)
-  >>- Deferred.List.iter (List.rev old_table) ~f:(fun (flow, prio) ->
+  (* Delete the old table from the bottom up *)
+  >>- Deferred.List.iter del_table ~f:(fun (flow, prio) ->
       send t.ctl c_id (0l, to_flow_del prio flow))
-  (* Install the new table at highest priority *)
-  >>- Deferred.List.iter new_table ~f:(fun (flow, _, prio) ->
-      send t.ctl c_id (0l, to_flow_mod prio flow))
-  (* Delete the new table from low priority *)
-  >>- Deferred.List.iter new_table ~f:(fun (flow, prio, _) ->
-      send t.ctl c_id (0l, to_flow_del prio flow))
-  >>- (t.edge <- SwitchMap.add t.edge sw_id (List.map new_table ~f:(fun (flow, _, prio) -> (flow, prio)));
+  >>- (t.edge <- SwitchMap.add t.edge sw_id new_table;
        return ())
 
 
@@ -441,11 +449,12 @@ let edge_update_table_for (t : t) ver pol (sw_id : switchId) : unit Deferred.t =
 let clear_old_table_for (t : t) ver sw_id : unit Deferred.t =
   let open SDN_Types in
   let delete_flows =
-    OpenFlow0x01.Message.FlowModMsg {(SDN_OpenFlow0x01.from_flow 0 {pattern = {all_pattern with dlVlan = Some ver};
-                                                                   action = [];
-                                                                   cookie = 0L;
-                                                                   idle_timeout = Permanent;
-                                                                   hard_timeout = Permanent})
+    OpenFlow0x01.Message.FlowModMsg {(SDN_OpenFlow0x01.from_flow 0
+                                        {pattern = {all_pattern with dlVlan = Some ver};
+                                         action = [];
+                                         cookie = 0L;
+                                         idle_timeout = Permanent;
+                                         hard_timeout = Permanent})
     with command = DeleteFlow} in
   let c_id = Controller.client_id_of_switch t.ctl sw_id in
   Monitor.try_with ~name:"clear_old_table_for" (fun () ->
