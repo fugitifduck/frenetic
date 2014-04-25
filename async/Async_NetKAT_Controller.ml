@@ -375,7 +375,7 @@ let compute_edge_table (t : t) ver table sw_id =
   List.fold match_table ~init:[] ~f:(fun acc r ->
       {r with action = List.map r.action ~f:(fun x -> List.map x ~f:(fix_actions))} :: acc)
 
-let (>>-) a b = a >>= fun _ -> b
+(* let (>>-) a b = a >>= fun _ -> b *)
 
 (* Comparison should be made based on patterns only, not actions *)
 (* Assumes both FT are sorted in descending order by priority *)
@@ -412,9 +412,9 @@ let swap_update_for (t : t) sw_id new_table : unit Deferred.t =
   Deferred.List.iter new_table ~f:(fun (flow, prio) ->
       send t.ctl c_id (0l, to_flow_mod prio flow))
   (* Delete the old table from the bottom up *)
-  >>- Deferred.List.iter del_table ~f:(fun (flow, prio) ->
+  >>= fun () -> Deferred.List.iter del_table ~f:(fun (flow, prio) ->
       send t.ctl c_id (0l, to_flow_del prio flow))
-  >>- (t.edge <- SwitchMap.add t.edge sw_id new_table;
+  >>= fun () -> (t.edge <- SwitchMap.add t.edge sw_id new_table;
        return ())
 
 
@@ -432,7 +432,7 @@ let edge_update_table_for (t : t) ver pol (sw_id : switchId) : unit Deferred.t =
     Log.debug ~tags
       "switch %Lu: Installing edge table %s" sw_id (SDN_Types.string_of_flowTable edge_table);
     swap_update_for t sw_id edge_table
-    >>- send_barrier_to_sw_with_timeout t sw_id)
+    >>= fun () -> send_barrier_to_sw_with_timeout t sw_id)
   >>= function
   | Ok () ->
     Log.debug ~tags
@@ -474,18 +474,18 @@ let consistently_update_table (t : t) pol : unit Deferred.t =
   (* Install internal update *)
   Log.debug ~tags "Installing internal tables for ver %d" ver_num;
   Log.flushed ()
-  >>-
+  >>= fun () ->
   Deferred.List.iter switches (internal_update_table_for t ver_num pol)
-  >>-
+  >>= fun () ->
   (Log.debug ~tags "Installing edge tables for ver %d" ver_num;
    Log.flushed ())
-  >>-
+  >>= fun () ->
   (* Install edge update *)
   Deferred.List.iter switches (edge_update_table_for t ver_num pol)
-  >>-
+  >>= fun () ->
   (* Delete old rules *)
   Deferred.List.iter switches (clear_old_table_for t (ver_num - 1))
-  >>-
+  >>= fun () ->
   (* Incr ver number *)
   return (incr ver)
 
