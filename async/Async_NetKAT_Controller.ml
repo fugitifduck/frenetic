@@ -15,7 +15,7 @@ module Log = Async_OpenFlow.Log
 
 let max_pending_connections = 64
 
-let _ = Log.set_level `Debug
+let _ = Log.set_level `Info
 
 let _ = Log.set_output
           [Log.make_filtered_output
@@ -235,11 +235,8 @@ let to_event w_out (t : t) evt =
           end
         | BarrierReply ->
           Log.debug ~tags "Received barrier_reply %Lu" switch_id;
-          Log.flushed ();          
           begin match XidMap.find t.barriers xid with
-            | None -> Log.error ~tags "to_event: received unexpected BarrierReply from %Lu" switch_id;
-              Log.flushed ();
-              ()
+            | None -> Log.error ~tags "to_event: received unexpected BarrierReply from %Lu" switch_id
             | Some ivar -> Ivar.fill ivar ()
           end;
           return []
@@ -401,6 +398,7 @@ let compute_edge_table (t : t) ver table sw_id =
 (* Comparison should be made based on patterns only, not actions *)
 (* Assumes both FT are sorted in descending order by priority *)
 let rec flowtable_diff (ft1 : (SDN_Types.flow*int) list) (ft2 : (SDN_Types.flow*int) list) =
+  let open SDN_Types in
   match ft1,ft2 with
   | (flow1,pri1)::ft1, (flow2,pri2)::ft2 ->
     if pri1 > pri2
@@ -416,6 +414,7 @@ let rec flowtable_diff (ft1 : (SDN_Types.flow*int) list) (ft2 : (SDN_Types.flow*
    - switch respects priorities when deleting flows
 *)
 let swap_update_for (t : t) sw_id new_table : unit Deferred.t =
+  let open OpenFlow0x01_Core in
   let max_priority = 65535 in
   let old_table = match SwitchMap.find t.edge sw_id with
     | Some ft -> ft
@@ -440,20 +439,16 @@ let swap_update_for (t : t) sw_id new_table : unit Deferred.t =
 
 
 let edge_update_table_for (t : t) ver pol (sw_id : switchId) : unit Deferred.t =
-  let to_flow_mod prio flow =
-    OpenFlow0x01.Message.FlowModMsg (SDN_OpenFlow0x01.from_flow prio flow) in
-  let c_id = Controller.client_id_of_switch t.ctl sw_id in
   t.locals <- SwitchMap.add t.locals sw_id
     (Optimize.specialize_policy sw_id pol);
   let local = NetKAT_LocalCompiler.compile sw_id pol in
   Monitor.try_with ~name:"edge_update_table_for" (fun _ ->
-    let priority = ref 65536 in
-    let table = NetKAT_LocalCompiler.to_table local in
-    let edge_table = compute_edge_table t ver table sw_id in
-    Log.debug ~tags
-      "switch %Lu: Installing edge table %s" sw_id (SDN_Types.string_of_flowTable edge_table);
-    swap_update_for t sw_id edge_table
-    >>= fun () -> send_barrier_to_sw_with_timeout t sw_id)
+      let table = NetKAT_LocalCompiler.to_table local in
+      let edge_table = compute_edge_table t ver table sw_id in
+      Log.debug ~tags
+        "switch %Lu: Installing edge table %s" sw_id (SDN_Types.string_of_flowTable edge_table);
+      swap_update_for t sw_id edge_table
+      >>= fun () -> send_barrier_to_sw_with_timeout t sw_id)
   >>= function
   | Ok () ->
     Log.debug ~tags
@@ -469,6 +464,7 @@ let edge_update_table_for (t : t) ver pol (sw_id : switchId) : unit Deferred.t =
 
 let clear_old_table_for (t : t) ver sw_id : unit Deferred.t =
   let open SDN_Types in
+  let open OpenFlow0x01_Core in  
   let delete_flows =
     OpenFlow0x01.Message.FlowModMsg {(SDN_OpenFlow0x01.from_flow 0
                                         {pattern = {all_pattern with dlVlan = Some ver};
