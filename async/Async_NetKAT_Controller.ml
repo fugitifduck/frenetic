@@ -277,38 +277,6 @@ let send_barrier_to_sw_with_timeout (t : t) (sw_id : switchId) : unit Deferred.t
       "Async_NetKAT_Controller.send_barrier_to_sw_with_timeout: switch %Lu timed out" sw_id;
     Log.flushed ()
 
-let internal_update_table_for (t : t) ver pol (sw_id : switchId) : unit Deferred.t =
-  let to_flow_mod prio flow =
-    OpenFlow0x01.Message.FlowModMsg (SDN_OpenFlow0x01.from_flow prio flow) in
-  let c_id = Controller.client_id_of_switch t.ctl sw_id in
-  t.locals <- SwitchMap.add t.locals sw_id
-    (Optimize.specialize_policy sw_id pol);
-  let local = NetKAT_LocalCompiler.compile sw_id pol in
-  Monitor.try_with ~name:"internal_update_table_for" (fun _ ->
-    let priority = ref 65536 in
-    (* Add match on ver *)    
-    let table = List.map (NetKAT_LocalCompiler.to_table local) ~f:(fun flow ->
-      {flow with pattern = { flow.pattern with dlVlan = Some ver }}) in
-    Log.debug ~tags
-      "switch %Lu: Installing internal table %s" sw_id (SDN_Types.string_of_flowTable table);
-    let open SDN_Types in
-    if List.length table <= 0
-      then raise (Assertion_failed (Printf.sprintf
-          "Controller.internal_update_table_for: empty table for switch %Lu" sw_id));
-      Deferred.List.iter table ~f:(fun flow ->
-          decr priority;
-          send t.ctl c_id (0l, to_flow_mod !priority flow))
-    >>= fun () -> send_barrier_to_sw_with_timeout t sw_id)
-  >>= function
-  | Ok () ->
-    Log.debug ~tags
-      "switch %Lu: installed internal table for ver %d" sw_id ver;
-    Log.flushed ()
-  | Error exn_ ->
-    Log.error ~tags
-      "switch %Lu: Failed to update table in internal_update_table_for" sw_id;
-    Log.flushed ()
-
 (* Topology detection doesn't really detect hosts. So, I treat any port not connected to a known switch as an edge port *)
 let get_edge_ports (t : t) (sw_id : switchId) =
   let open Async_NetKAT in
@@ -339,6 +307,61 @@ let get_internal_ports (t : t) (sw_id : switchId) =
         end
       | _ -> acc) (vertex_to_ports topo sw) PortSet.empty
 
+let compute_internal_table (t : t) ver table sw_id =
+  let internal_ports = get_internal_ports t sw_id in
+  let open SDN_Types in
+  let open Async_NetKAT.Net.Topology in
+  let rec fix_actions = function
+    | Output (Physical pt) :: acts ->
+      if not (PortSet.mem pt internal_ports)
+      then
+        (Modify (SetVlan None)) :: (Output (Physical pt)) :: (fix_actions acts)
+      else
+        (Modify (SetVlan (Some ver))) :: (Output (Physical pt)) :: (fix_actions acts)
+    | Output (Controller n) :: acts ->
+      (Modify (SetVlan None)) :: (Output (Controller n)) :: (fix_actions acts)
+    | Output _ :: acts ->
+      raise (Assertion_failed "Controller.compute_internal_table: Port not supported by consistent updates")
+    | act :: acts ->
+      act :: (fix_actions acts)
+    | [] -> []
+  in
+  let match_table = List.fold table ~init:[] ~f:(fun acc r ->
+      {r with pattern = {r.pattern with dlVlan = Some ver}} :: acc)
+  in
+  List.fold match_table ~init:[] ~f:(fun acc r ->
+      {r with action = List.map r.action ~f:(fun x -> List.map x ~f:(fix_actions))} :: acc)
+    
+let internal_update_table_for (t : t) ver pol (sw_id : switchId) : unit Deferred.t =
+  let to_flow_mod prio flow =
+    OpenFlow0x01.Message.FlowModMsg (SDN_OpenFlow0x01.from_flow prio flow) in
+  let c_id = Controller.client_id_of_switch t.ctl sw_id in
+  t.locals <- SwitchMap.add t.locals sw_id
+    (Optimize.specialize_policy sw_id pol);
+  let local = NetKAT_LocalCompiler.compile sw_id pol in
+  Monitor.try_with ~name:"internal_update_table_for" (fun _ ->
+    let priority = ref 65536 in
+    (* Add match on ver *)    
+    let table = compute_internal_table t ver (NetKAT_LocalCompiler.to_table local) sw_id in
+    Log.debug ~tags
+      "switch %Lu: Installing internal table %s" sw_id (SDN_Types.string_of_flowTable table);
+    let open SDN_Types in
+    if List.length table <= 0
+      then raise (Assertion_failed (Printf.sprintf
+          "Controller.internal_update_table_for: empty table for switch %Lu" sw_id));
+      Deferred.List.iter table ~f:(fun flow ->
+          decr priority;
+          send t.ctl c_id (0l, to_flow_mod !priority flow))
+    >>= fun () -> send_barrier_to_sw_with_timeout t sw_id)
+  >>= function
+  | Ok () ->
+    Log.debug ~tags
+      "switch %Lu: installed internal table for ver %d" sw_id ver;
+    Log.flushed ()
+  | Error exn_ ->
+    Log.error ~tags
+      "switch %Lu: Failed to update table in internal_update_table_for" sw_id;
+    Log.flushed ()
 
 let compute_edge_table (t : t) ver table sw_id =
   let internal_ports = get_internal_ports t sw_id in
@@ -352,7 +375,7 @@ let compute_edge_table (t : t) ver table sw_id =
       then
         (Modify (SetVlan None)) :: (Output (Physical pt)) :: (fix_actions acts)
       else
-        (Modify (SetVlan (Some ver))) :: (Modify (SetVlanPcp 1)) :: (Output (Physical pt)) :: (fix_actions acts)
+        (Modify (SetVlan (Some ver))) :: (Output (Physical pt)) :: (fix_actions acts)
     | Output (Controller n) :: acts ->
       (Modify (SetVlan None)) :: (Output (Controller n)) :: (fix_actions acts)
     | Output _ :: acts ->
@@ -374,8 +397,6 @@ let compute_edge_table (t : t) ver table sw_id =
   in
   List.fold match_table ~init:[] ~f:(fun acc r ->
       {r with action = List.map r.action ~f:(fun x -> List.map x ~f:(fix_actions))} :: acc)
-
-(* let (>>-) a b = a >>= fun _ -> b *)
 
 (* Comparison should be made based on patterns only, not actions *)
 (* Assumes both FT are sorted in descending order by priority *)
