@@ -15,7 +15,7 @@ module Log = Async_OpenFlow.Log
 
 let max_pending_connections = 64
 
-let _ = Log.set_level `Info
+let _ = Log.set_level `Debug
 
 let _ = Log.set_output
           [Log.make_filtered_output
@@ -192,6 +192,8 @@ let to_event w_out (t : t) evt =
         ps [SwitchDown switch_id])
     | `Message (c_id, (xid, msg)) ->
       let open OpenFlow0x01.Message in
+      Log.info ~tags "Async_NetKAT_Controller.to_event received message %s" (OpenFlow0x01.Message.to_string msg);
+      Log.flushed () >>= fun () ->
       let switch_id = Controller.switch_id_of_client t.ctl c_id in
       begin match msg with
         | PacketInMsg pi ->
