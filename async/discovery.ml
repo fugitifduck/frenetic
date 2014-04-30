@@ -161,6 +161,12 @@ module Switch = struct
                           Neg(Test(EthType Probe.protocol)))) in
     seq (create_static gpol) app
 
+  let guard_policy pol =
+    let open NetKAT_Types in    
+    Seq(Filter(And(Neg(Test(EthSrc Probe.mac)),
+                   Neg(Test(EthType Probe.protocol)))),
+        pol)
+      
   let create () =
     let open NetKAT_Types in
     let open Async_NetKAT in
@@ -351,6 +357,9 @@ end
 
 let guard app =
   Switch.guard app
+
+let guard_policy pol =
+  Switch.guard_policy pol
 
 let events t =
   Switch.Ctl.events t

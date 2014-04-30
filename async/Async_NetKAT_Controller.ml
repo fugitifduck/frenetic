@@ -605,4 +605,70 @@ let start app ?(port=6633) ?(update = `BestEffort) () =
     | Error exn_ ->
       Log.error ~tags "start: Exception occured %s" (Exn.to_string exn_);
       Log.flushed ())
-        
+
+let event_handler (t : t) app event =
+  let app_pipe = Async_NetKAT.events_from_app app in
+  Pipe.write app_pipe (t.nib,event) >>= fun () ->
+  match event with
+  | NetKAT_Types.SwitchUp sw_id ->
+    update_table_for t sw_id (Async_NetKAT.last_policy app)
+  | _ -> return ()
+
+let best_effort_policy_handler (t : t) app pol =
+  Async_NetKAT.update_last_policy app pol;
+  Deferred.List.iter (get_switchids !(t.nib)) (fun sw -> update_table_for t sw pol)
+
+let consistent_policy_handler (t : t) app pol =
+  Async_NetKAT.update_last_policy app pol;
+  consistently_update_table t pol
+
+let start_independent app ?(port=6633) ?(update = `BestEffort) () =
+  let open Async_OpenFlow.Stage in
+  let policy_handler = match update with
+    | `BestEffort -> best_effort_policy_handler
+    | `PerPacketConsistent -> consistent_policy_handler in
+  Controller.create ~log_disconnects:true ~max_pending_connections ~port ()
+  >>> fun ctl ->
+  let t = {
+    ctl = ctl;
+    nib = ref (Net.Topology.empty ());
+    locals = SwitchMap.empty;
+    barriers = XidMap.empty;
+    edge = SwitchMap.empty;
+  } in
+
+  (* The pipe for packet_outs. The Pipe.iter below will run in its own logical
+   * thread, sending packet outs to the switch whenever it's scheduled.
+   *)
+  let r_out, w_out = Pipe.create () in
+  let r_out = Pipe.interleave [r_out; Async_NetKAT.packet_out_from_app app] in
+  Deferred.don't_wait_for (Pipe.iter r_out ~f:(fun out ->
+      let (sw_id, pkt_out) = out in
+      Monitor.try_with ~name:"packet_out" (fun () ->
+          let c_id = Controller.client_id_of_switch ctl sw_id in
+          send ctl c_id (0l, OpenFlow0x01.Message.PacketOutMsg
+                           (SDN_OpenFlow0x01.from_packetOut pkt_out)))
+      >>= function
+      | Ok () -> return ()
+      | Error exn_ ->
+        Log.error ~tags "switch %Lu: Failed to send packet_out" sw_id;
+        Log.flushed ()));
+  let stages = let open Controller in
+    (local (fun t -> t.ctl)
+       features)
+    >=> (to_event w_out) in
+  
+  (* Build up the application by adding topology discovery into the mix. *)
+  let events = run stages t (Controller.listen ctl) in
+  (* The discovery application itself will generate events, so the actual
+   * event stream must be a combination of switch events and synthetic
+   * topology discovery events. Pipe.interleave will wait until one of the
+   * pipes is readable, take a batch, and send it along.
+   *
+   * Whatever happens, happens. Can't stop won't stop.
+   * *)
+  Deferred.don't_wait_for (
+    (Pipe.iter events ~f:(event_handler t app)));
+  Deferred.don't_wait_for (
+    (Pipe.iter (Async_NetKAT.policies_from_app app) ~f:(policy_handler t app)))
+  

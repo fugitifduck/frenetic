@@ -94,3 +94,12 @@ exception Sequence_error of PipeSet.t * PipeSet.t
     will distribute events across the two apps, sequence reactive updates to
     policies, and concatenates the list of [packet_outs] that they produce.  *)
 val seq : app -> app -> app
+
+type independent_app
+
+val create_ind : ?pipes:PipeSet.t -> policy -> (Net.Topology.t ref * event) Pipe.Writer.t -> policy Pipe.Reader.t -> (switchId * SDN_Types.pktOut) Pipe.Reader.t -> independent_app
+val events_from_app : independent_app -> (Net.Topology.t ref * event) Pipe.Writer.t
+val policies_from_app : independent_app -> policy Pipe.Reader.t
+val packet_out_from_app : independent_app -> (switchId * SDN_Types.pktOut) Pipe.Reader.t
+val last_policy : independent_app -> policy
+val update_last_policy : independent_app -> policy -> unit

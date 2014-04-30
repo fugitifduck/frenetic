@@ -142,3 +142,32 @@ let seq (a1 : app) (a2: app) : app =
             | None, Some(pol2) ->
               return (Some(Seq(a1.default, pol2)))
   }
+
+type independent_app = {
+  pipes : PipeSet.t;
+  policies : policy Pipe.Reader.t;
+  packet_out : (switchId * SDN_Types.pktOut) Pipe.Reader.t;
+  events : (Net.Topology.t ref * event) Pipe.Writer.t;  
+  mutable default : policy
+}
+
+let create_ind ?pipes (default : policy) (events : (Net.Topology.t ref * event) Pipe.Writer.t) (policies : policy Pipe.Reader.t) (packet_out : (switchId * SDN_Types.pktOut) Pipe.Reader.t) : independent_app =
+  let pipes = match pipes with
+    | None -> PipeSet.empty
+    | Some(pipes) -> pipes in
+  { pipes; default; policies; events; packet_out }
+
+let events_from_app (app : independent_app) =
+  app.events
+
+let policies_from_app (app : independent_app) =
+  app.policies
+
+let packet_out_from_app (app : independent_app) =
+  app.packet_out
+
+let last_policy (app : independent_app) =
+  app.default
+
+let update_last_policy (app : independent_app) pol =
+  app.default <- pol
